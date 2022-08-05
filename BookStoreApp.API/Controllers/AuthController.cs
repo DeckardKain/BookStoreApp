@@ -1,9 +1,14 @@
 ﻿using AutoMapper;
 using BookStoreApp.API.Data;
 using BookStoreApp.API.Models.User;
+using BookStoreApp.API.Static;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
 
 namespace BookStoreApp.API.Controllers
 {
@@ -14,42 +19,114 @@ namespace BookStoreApp.API.Controllers
         private readonly ILogger _logger;
         private readonly IMapper _mapper;
         private readonly UserManager<ApiUser> _userManager;
+        private readonly IConfiguration _configuration;
 
-        public AuthController(ILogger logger, IMapper mapper, UserManager<ApiUser> userManager)
+        public AuthController(ILogger<AuthController> logger, IMapper mapper, UserManager<ApiUser> userManager, IConfiguration configuration)
         {
             this._logger = logger;
             this._mapper = mapper;
             this._userManager = userManager;
+            this._configuration = configuration;
         }
 
         [HttpPost]
         [Route("register")]
         public async Task<IActionResult> Register (UserDTO userDTO)
         {
-            var user = _mapper.Map<ApiUser>(userDTO);
-            var result = await _userManager.CreateAsync(user, userDTO.Password);
+            _logger.LogInformation($"Registration Attempt for {userDTO.Email}");
 
-            if (!result.Succeeded)
+            try
             {
-                foreach(var error in result.Errors)
-                {
-                    ModelState.AddModelError(error.Code, error.Description);
+                var user = _mapper.Map<ApiUser>(userDTO);
+                user.UserName = userDTO.Email;
+                var result = await _userManager.CreateAsync(user, userDTO.Password);
 
+                if (!result.Succeeded)
+                {
+                    foreach (var error in result.Errors)
+                    {
+                        ModelState.AddModelError(error.Code, error.Description);
+
+                    }
+
+                    return BadRequest(ModelState);
                 }
 
-                return BadRequest(ModelState);
+                await _userManager.AddToRoleAsync(user, "User");
+
+                return Accepted();
             }
-
-            await _userManager.AddToRoleAsync(user, "User");
-
-            return Accepted();
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Something went wrong in the {nameof(Register)}");
+                return Problem($"Something went wrong in the {nameof(Register)}", statusCode: 500);
+            }
         }
 
-
-
-        /*public async Task<IActionResult> Login(string returnUrl)
+        [HttpPost]
+        [Route("login")]
+        public async Task<ActionResult<AuthResponse>> Login(LoginUserDTO userDTO)
         {
+            _logger.LogInformation($"Login attempt for {userDTO.Email}");
+            try
+            {
+                var user = await _userManager.FindByEmailAsync(userDTO.Email);
+                var passwordValid = await _userManager.CheckPasswordAsync(user, userDTO.Password);
+                if (user == null || passwordValid == false)
+                {
+                    return Unauthorized(userDTO);
+                }
 
-        }*/
+                var tokenString = await GenerateToken(user);
+
+                var response = new AuthResponse
+                {
+                    Email = userDTO.Email,
+                    Token = tokenString,
+                    UserId = user.Id
+                };
+
+                return Accepted(response);
+
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Something went wrong in the {nameof(Login)}");
+                return Problem($"Something went wrong in the {nameof(Login)}", statusCode: 500);
+            }
+
+        }
+
+        private async Task<string> GenerateToken(ApiUser user)
+        {
+            var securityKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["JwtSettings:Key"]));
+            var credentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
+
+            var roles = await _userManager.GetRolesAsync(user);
+            var roleClaims = roles.Select(q => new Claim(ClaimTypes.Role, q)).ToList(); // q represents each string in the list.
+
+            var userClaims = await _userManager
+                .GetClaimsAsync(user);
+
+            var claims = new List<Claim>
+            {
+                new Claim(JwtRegisteredClaimNames.Sub, user.UserName),
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+                new Claim(JwtRegisteredClaimNames.Email, user.Email),
+                new Claim(CustomClaimTypes.Uid, user.Id)
+            }
+            .Union(userClaims)
+            .Union(roleClaims);
+
+            var token = new JwtSecurityToken(
+                issuer: _configuration["JwtSettings:Issuer"],
+                audience: _configuration["JwtSettings:Audience"],
+                claims: claims,
+                expires: DateTime.UtcNow.AddHours(Convert.ToInt32(_configuration["JwtSettings:Duration"])),
+                signingCredentials: credentials
+                );
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
     }
 }
